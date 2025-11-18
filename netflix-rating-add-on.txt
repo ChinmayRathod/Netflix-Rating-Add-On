@@ -1,0 +1,294 @@
+// ==UserScript==
+// @name         Netflix Rating Injector — Complete 2025 (uses OMDb)
+// @namespace    http://tampermonkey.net/
+// @version      4.0
+// @description  Inject IMDb + Metascore ratings on Netflix thumbnails, preview modals and watch pages (2025-ready). Caches results and queues requests to avoid spamming OMDb.
+// @match        https://www.netflix.com/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @connect      omdbapi.com
+// ==/UserScript==
+
+(function () {
+    "use strict";
+
+    /*********** CONFIG ***********/
+    // Your OMDb key (as requested, using your earlier value)
+    const OMDB_KEY = "ENTER_OMDB_KEY"; // ← if this is invalid, replace with a valid 8-char key
+
+    // Cache & queue settings
+    const CACHE_KEY = "nf_rating_cache_v4";
+    const CACHE_TTL_MS = 1000 * 60 * 60 * 24 * 14; // 14 days TTL (if stored with timestamp)
+    const QUEUE_CONCURRENCY = 3; // number of concurrent GM_xmlhttpRequest calls
+    const REQUEST_INTERVAL_MS = 250; // minimal gap between dequeues (throttling)
+
+    /*********** STORAGE / CACHE ***********/
+    let rawCache = GM_getValue(CACHE_KEY, {});
+    // Normalize cache entries to { value, ts } form
+    const cache = {};
+    for (const k of Object.keys(rawCache || {})) {
+        try {
+            const v = rawCache[k];
+            // allow older format (string) for backward compat
+            if (typeof v === "string") cache[k] = { value: v, ts: Date.now() };
+            else if (v && v.value) cache[k] = v;
+        } catch { /* ignore malformed */ }
+    }
+
+    function saveCache() {
+        try {
+            GM_setValue(CACHE_KEY, cache);
+        } catch (e) {
+            console.warn("Failed to save cache", e);
+        }
+    }
+
+    function getCached(key) {
+        const e = cache[key];
+        if (!e) return null;
+        if (Date.now() - e.ts > CACHE_TTL_MS) {
+            delete cache[key];
+            saveCache();
+            return null;
+        }
+        return e.value;
+    }
+
+    function setCached(key, value) {
+        cache[key] = { value, ts: Date.now() };
+        // write asynchronously but not too often
+        saveCache();
+    }
+
+    /*********** REQUEST QUEUE (throttled + limited concurrency) ***********/
+    const queue = [];
+    let active = 0;
+    let lastDequeue = 0;
+
+    function enqueueFetch(title, cb) {
+        queue.push({ title, cb });
+        processQueue();
+    }
+
+    function processQueue() {
+        if (active >= QUEUE_CONCURRENCY) return;
+        if (queue.length === 0) return;
+        const now = Date.now();
+        if (now - lastDequeue < REQUEST_INTERVAL_MS && active === 0) {
+            setTimeout(processQueue, REQUEST_INTERVAL_MS - (now - lastDequeue));
+            return;
+        }
+        const item = queue.shift();
+        active++;
+        lastDequeue = Date.now();
+
+        doFetchRating(item.title, (rating) => {
+            try { item.cb(rating); } catch (e) { console.error(e); }
+            active--;
+            setTimeout(processQueue, REQUEST_INTERVAL_MS);
+        });
+    }
+
+    function doFetchRating(title, cb) {
+        // If cached now (race), return
+        const ck = title.toLowerCase();
+        const cached = getCached(ck);
+        if (cached) {
+            cb(cached);
+            return;
+        }
+
+        // Build URL
+        const url = `https://www.omdbapi.com/?t=${encodeURIComponent(title)}&apikey=${encodeURIComponent(OMDB_KEY)}`;
+
+        GM_xmlhttpRequest({
+            method: "GET",
+            url,
+            onload: function (res) {
+                try {
+                    const data = JSON.parse(res.responseText || "{}");
+                    if (data && data.Response === "True") {
+                        const imdb = (data.imdbRating && data.imdbRating !== "N/A") ? `IMDb ${data.imdbRating}` : null;
+                        const meta = (data.Metascore && data.Metascore !== "N/A") ? `Metascore ${data.Metascore}` : null;
+                        const final = imdb && meta ? `${imdb} • ${meta}` : imdb || meta || "No rating";
+                        setCached(ck, final);
+                        cb(final);
+                    } else {
+                        // OMDb returned false; include error string if available
+                        const err = data && data.Error ? data.Error : "No rating";
+                        setCached(ck, err);
+                        cb(err);
+                    }
+                } catch (e) {
+                    console.error("OMDb parse error", e, res);
+                    setCached(ck, "Error");
+                    cb("Error");
+                }
+            },
+            onerror: function (err) {
+                console.error("OMDb request error", err);
+                setCached(title.toLowerCase(), "Error");
+                cb("Error");
+            },
+            timeout: 10_000
+        });
+    }
+
+    /*********** BADGE INJECTION ***********/
+    const BADGE_CLASS = "tm-nf-rating-badge-v4";
+
+    function createOrUpdateBadge(container, text) {
+        if (!container) return;
+        let badge = container.querySelector(`.${BADGE_CLASS}`);
+        if (!badge) {
+            badge = document.createElement("div");
+            badge.className = BADGE_CLASS;
+            badge.style.cssText = `
+                position: absolute;
+                top: 8px;
+                right: 10px;
+                z-index: 999999;
+                background: rgba(0,0,0,0.78);
+                color: #fff;
+                padding: 4px 8px;
+                border-radius: 6px;
+                font-weight: 600;
+                font-size: 12px;
+                line-height: 1;
+                pointer-events: none;
+                backdrop-filter: blur(3px);
+            `;
+            // Ensure container has positioning context
+            const oldPos = container.style.position;
+            if (!oldPos || oldPos === "") container.style.position = "relative";
+            container.appendChild(badge);
+        }
+        badge.textContent = text;
+    }
+
+    /*********** TITLE EXTRACTION LOGIC ***********/
+    // 1) For grid cards: read from anchor[aria-label]
+    // 2) For preview modal / title pages: try multiple selectors (newer Netflix DOM)
+    function processTitleCards() {
+        const cards = document.querySelectorAll(".title-card, .title-card-container, [data-uia='title-card-container']");
+        if (!cards || cards.length === 0) return;
+
+        cards.forEach(card => {
+            // avoid duplicates
+            if (card.dataset.tmRatingInjected) return;
+            // mark early to avoid races
+            card.dataset.tmRatingInjected = "1";
+
+            // anchor with aria-label is most reliable on grid
+            const anchor = card.querySelector("a[aria-label]");
+            let title = null;
+            if (anchor) {
+                title = anchor.getAttribute("aria-label");
+            } else {
+                // fallback: look for fallback text
+                const fallback = card.querySelector(".fallback-text, .fallback-text-container, .title");
+                if (fallback && fallback.textContent) title = fallback.textContent.trim();
+            }
+
+            if (!title) {
+                // nothing to do for now
+                delete card.dataset.tmRatingInjected; // allow retry later if DOM changes
+                return;
+            }
+
+            // find a good visual container (poster box) to place badge
+            const poster = card.querySelector(".boxart-container, .boxart, .title-card .boxart-container");
+            const injectTarget = poster || card;
+
+            createOrUpdateBadge(injectTarget, "Loading...");
+
+            // If cached, show instantly
+            const ck = title.toLowerCase();
+            const cached = getCached(ck);
+            if (cached) {
+                createOrUpdateBadge(injectTarget, cached);
+                return;
+            }
+
+            // enqueue request
+            enqueueFetch(title, (rating) => {
+                createOrUpdateBadge(injectTarget, rating);
+            });
+        });
+    }
+
+    function processPreviewAndTitlePages() {
+        // Try selectors for preview modal or title page where a title is visible
+        const possibleTitleEls = [
+            'h1[data-uia="title-info-title"]',
+            'h1[data-uia="title"]',
+            'h1.title-title',
+            '.previewModal--info-title',
+            '.previewModal--player-titleTreatment-logo',
+            '[data-uia="video-title"]',
+            '[data-uia="title"]',
+            'h1'
+        ];
+
+        let titleEl = null;
+        for (const sel of possibleTitleEls) {
+            titleEl = document.querySelector(sel);
+            if (titleEl && titleEl.textContent && titleEl.textContent.trim().length > 0) break;
+        }
+
+        if (!titleEl) return;
+
+        const title = titleEl.textContent.trim();
+        if (!title) return;
+
+        // determine a container to inject into (preview modal info or player overlay)
+        const container = titleEl.closest(".previewModal--container, .previewModal--info, .title-info, .video-title, .previewModal") || titleEl.parentElement || document.body;
+
+        // show loading
+        createOrUpdateBadge(container, "Loading...");
+
+        // cached?
+        const ck = title.toLowerCase();
+        const cached = getCached(ck);
+        if (cached) {
+            createOrUpdateBadge(container, cached);
+            return;
+        }
+
+        // fetch via queue
+        enqueueFetch(title, (rating) => createOrUpdateBadge(container, rating));
+    }
+
+    /*********** OBSERVER / BOOTSTRAP ***********/
+    // Debounce utility
+    function debounce(fn, wait) {
+        let t;
+        return function () {
+            clearTimeout(t);
+            t = setTimeout(fn, wait);
+        };
+    }
+
+    const debouncedWork = debounce(() => {
+        try {
+            processTitleCards();
+            processPreviewAndTitlePages();
+        } catch (e) {
+            console.error("Netflix Rating Injector: processing error", e);
+        }
+    }, 200);
+
+    const observer = new MutationObserver(() => debouncedWork());
+    observer.observe(document, { childList: true, subtree: true });
+
+    // Run once on load
+    window.addEventListener("load", () => {
+        setTimeout(() => debouncedWork(), 800);
+    });
+
+    // Also run on initial script start (userscript may fire after load sometimes)
+    setTimeout(() => debouncedWork(), 300);
+
+    console.info("Netflix Rating Injector (Tampermonkey) started. Using OMDb key:", OMDB_KEY ? "(provided)" : "(none)");
+})();
